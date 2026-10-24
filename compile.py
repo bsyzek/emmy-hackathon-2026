@@ -9,6 +9,7 @@ from pathlib import Path
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.kernel.ir import KernelOp
 from emmy.compiler.ir.expr import Var, Literal, BinaryExpr
+from emmy.compiler.ir.stmt.leaves import Load, Assign, Write
 
 PTX_REG_TYPES = {
     "f": ".f32",
@@ -23,8 +24,9 @@ INDEX_OPS = {
 }
 
 FLOAT_OPS = {
-    "add": "add.f32",
-    "multiply": "mul.f32"
+    "add": ("add.f32", []),
+    "multiply": ("mul.f32", []),
+    "relu": ("max.f32", ["0f00000000"])
 }
 
 
@@ -135,11 +137,13 @@ class KernelBuilder:
         if stmt.op.name not in FLOAT_OPS:
             raise NotImplementedError(f"float op {stmt.op.name} is not implemented yet")
 
-        instr = FLOAT_OPS[stmt.op.name]
+        instr, extras = FLOAT_OPS[stmt.op.name]
         registers = [self.values[a] for a in stmt.args]
+        operands = registers + extras
+
         dst = self.new_reg("f")
 
-        self.emit(f"{instr} {dst}, {", ".join(registers)};")
+        self.emit(f"{instr} {dst}, {", ".join(operands)};")
         self.values[stmt.name] = dst
 
     def emit_write(self, stmt):
@@ -161,6 +165,18 @@ class KernelBuilder:
         else:
             operands = ", ".join(registers)
             self.emit(f"st.global.v{count}.f32 [{addr}], {{{operands}}};")
+
+    def emit_body(self, stmts):
+        """Translate each body statement in order, dispatching on its type."""
+        for stmt in stmts:
+            if isinstance(stmt, Load):
+                self.emit_load(stmt)
+            elif isinstance(stmt, Assign):
+                self.emit_assign(stmt)
+            elif isinstance(stmt, Write):
+                self.emit_write(stmt)
+            else:
+                raise NotImplementedError(f"stmt type {type(stmt).__name__}")
 
     def reg_decls(self) -> list[str]:
         """Return one .reg declaration per register family in use, sized by its count."""
@@ -255,15 +271,7 @@ def main():
     kb.emit_bounds_guard(tile.axes[0].name,
                          tile.axes[0].extent.as_static())
 
-    kb.emit_load(tile.body[0])
-    kb.emit_load(tile.body[1])
-    kb.emit_assign(tile.body[2])
-
-    kb.emit_load(tile.body[3])
-    kb.emit_load(tile.body[4])
-
-    kb.emit_assign(tile.body[5])
-    kb.emit_write(tile.body[6])
+    kb.emit_body(tile.body)
 
     print("\n".join(header))
     print()
