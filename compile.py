@@ -11,12 +11,14 @@ from pathlib import Path
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.kernel.ir import KernelOp, WarpShuffle, Smem, Sync, TreeHalve
 from emmy.compiler.ir.expr import Var, Literal, BinaryExpr
-from emmy.compiler.ir.stmt.leaves import Load, Assign, Write, Accum
+from emmy.compiler.ir.stmt.leaves import Load, Assign, Write, Accum, Let
 from emmy.compiler.ir.stmt.blocks import StridedLoop, Cond
 
 def ptx_f32(x: float) -> str:
     """Return x as an exact PTX f32 literal: 0f + its 8 hex IEEE-754 digits, e.g. 1.0 -> 0f3F800000."""
     return "0f" + struct.pack(">f", x).hex().upper()
+
+LOG2_E = math.log2(math.e)
 
 PTX_REG_TYPES = {
     "f": ".f32",
@@ -34,7 +36,12 @@ FLOAT_OPS = {
     "add": ("add.f32", []),
     "multiply": ("mul.f32", []),
     "relu": ("max.f32", ["0f00000000"]),
-    "divide": ("div.rn.f32", [])
+    "divide": ("div.rn.f32", []),
+    "reciprocal": ("rcp.rn.f32", []),
+    "sqrt": ("sqrt.rn.f32", []),
+    "maximum": ("max.f32", []),
+    "subtract": ("sub.f32", []),
+    "copy": ("mov.f32", [])
 }
 
 COMPARISON_TABLE = {
@@ -185,6 +192,18 @@ class KernelBuilder:
 
     def emit_assign(self, stmt):
         """Emit one float elementwise op over already-computed values; record the result under its name."""
+
+        if stmt.op.name == "exp":
+            x = self.values[stmt.args[0]]
+            t = self.new_reg("f")
+            self.emit(f"mul.f32 {t}, {x}, {ptx_f32(LOG2_E)};")
+
+            dst = self.new_reg("f")
+            self.emit(f"ex2.approx.f32 {dst}, {t};")
+
+            self.values[stmt.name] = dst
+            return
+
         if stmt.op.name not in FLOAT_OPS:
             raise NotImplementedError(f"float op {stmt.op.name} is not implemented yet")
 
@@ -242,6 +261,8 @@ class KernelBuilder:
                 self.emit_sync(stmt)
             elif isinstance(stmt, TreeHalve):
                 self.emit_tree_halve(stmt)
+            elif isinstance(stmt, Let):
+                self.emit_let(stmt)
             else:
                 raise NotImplementedError(f"stmt type {type(stmt).__name__}")
 
@@ -250,15 +271,20 @@ class KernelBuilder:
         self.lines.append(f"{label}:")
 
     def emit_accum(self, stmt):
-        """Fold a value into its loop accumulator in place (acc = op(acc, value)); no new register."""
+        """Fold a value into its loop accumulator in place; no new register.
+
+        Normally acc = op(acc, value). With a base (online softmax rescales the old sum first),
+        acc = op(base, value): the base replaces the old accumulator as the first operand.
+        """
         accum = self.values[stmt.name]
         val = self.values[stmt.value]
+        first = accum if stmt.base is None else self.values[stmt.base]
 
         if stmt.op.name not in FLOAT_OPS:
             raise NotImplementedError(f"float op {stmt.op.name} is not implemented yet")
 
         instr, extras = FLOAT_OPS[stmt.op.name]
-        self.emit(f"{instr} {accum}, {accum}, {val};")
+        self.emit(f"{instr} {accum}, {first}, {val};")
 
     def emit_strided_loop(self, stmt):
         """Emit a loop from start to the axis extent in steps of step, seeding its accumulators first."""
@@ -393,6 +419,15 @@ class KernelBuilder:
                 value = r
 
             self.values[axis.name] = value
+
+    def emit_let(self, stmt):
+        """Bind a name to a float constant (e.g. one = 1.0) in a fresh %f register."""
+        if isinstance(stmt.value, Literal):
+            f = self.new_reg("f")
+            self.emit(f"mov.f32 {f}, {ptx_f32(stmt.value.value)};")
+            self.values[stmt.name] = f
+        else:
+            raise NotImplementedError(f"Let of {type(stmt.value).__name__} not supported yet")
 
     def new_label(self, prefix: str) -> str:
         """Return a fresh, unique label name like LOOP_0; emits nothing."""
