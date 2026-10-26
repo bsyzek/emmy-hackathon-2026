@@ -1,6 +1,16 @@
 """Compile an Emmy Kernel IR file to PTX.
 
 Usage: python compile.py path/to/kernel.ir.json > out.ptx
+
+The compiler reads the IR graph (plus the meta.json next to it, for the parameter order and
+buffer shapes), finds the single KernelOp, and translates its Tile body into PTX:
+
+1. Header and signature: .version/.target, then one .u64 pointer parameter per buffer.
+2. Prologue: load each pointer, compute the thread's global index, guard threads past the
+   Tile's last cell, and split the index into the Tile's named axes.
+3. Body: walk the IR statements in order, one handler per statement type. A KernelBuilder
+   hands out fresh virtual registers and maps IR value names to the registers holding them.
+4. Output: the register declarations are printed first, though they are only known last.
 """
 import json
 import math
@@ -9,52 +19,73 @@ import sys
 from pathlib import Path
 
 from emmy.compiler.graph import Graph
-from emmy.compiler.ir.kernel.ir import KernelOp, WarpShuffle, Smem, Sync, TreeHalve
-from emmy.compiler.ir.expr import Var, Literal, BinaryExpr
-from emmy.compiler.ir.stmt.leaves import Load, Assign, Write, Accum, Let
-from emmy.compiler.ir.stmt.blocks import StridedLoop, Cond
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve, WarpShuffle
+from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Let, Load, Write
+
 
 def ptx_f32(x: float) -> str:
     """Return x as an exact PTX f32 literal: 0f + its 8 hex IEEE-754 digits, e.g. 1.0 -> 0f3F800000."""
     return "0f" + struct.pack(">f", x).hex().upper()
 
+
+# --- Translation tables ---------------------------------------------------------------------
+
 LOG2_E = math.log2(math.e)
 
+EXIT_LABEL = "DONE"
+
+# Register family prefix -> PTX register type.
 PTX_REG_TYPES = {
     "f": ".f32",
     "rd": ".u64",
     "r": ".u32",
-    "p": ".pred"
+    "p": ".pred",
 }
 
+# Integer operators in index expressions -> PTX instruction.
 INDEX_OPS = {
     "+": "add.u32",
-    "*": "mul.lo.u32"
+    "*": "mul.lo.u32",
 }
 
+# Float elementwise op name -> (PTX instruction, extra operands appended after the arguments).
+# exp is not here: it takes two instructions (see KernelBuilder.emit_assign).
 FLOAT_OPS = {
     "add": ("add.f32", []),
+    "subtract": ("sub.f32", []),
     "multiply": ("mul.f32", []),
-    "relu": ("max.f32", ["0f00000000"]),
     "divide": ("div.rn.f32", []),
     "reciprocal": ("rcp.rn.f32", []),
     "sqrt": ("sqrt.rn.f32", []),
     "maximum": ("max.f32", []),
-    "subtract": ("sub.f32", []),
-    "copy": ("mov.f32", [])
+    "relu": ("max.f32", [ptx_f32(0.0)]),
+    "copy": ("mov.f32", []),
 }
 
+# Comparison operators in Cond -> setp comparison.
 COMPARISON_TABLE = {
     "==": "eq",
     "!=": "ne",
     "<": "lt",
     "<=": "le",
     ">": "gt",
-    ">=": "ge"
+    ">=": "ge",
 }
+
+
+def float_op(name: str) -> tuple[str, list[str]]:
+    """Return (instruction, extra operands) for a float elementwise op; raise if unsupported."""
+    if name not in FLOAT_OPS:
+        raise NotImplementedError(f"float op {name!r} not supported")
+    return FLOAT_OPS[name]
+
 
 class KernelBuilder:
     """Accumulates a kernel body's PTX lines and hands out fresh virtual registers."""
+
+    # --- State and helpers ------------------------------------------------------------------
 
     def __init__(self):
         self.lines = []
@@ -69,9 +100,11 @@ class KernelBuilder:
             "f": 0,
             "rd": 0,
             "r": 0,
-            "p": 0 }
+            "p": 0,
+        }
 
     def set_shapes(self, args):
+        """Record each global buffer's shape from meta.json's args, for flattening indices."""
         self.shapes = {a["name"]: a["shape"] for a in args}
 
     def new_reg(self, kind: str) -> str:
@@ -81,9 +114,31 @@ class KernelBuilder:
         self.reg_counts[kind] += 1
         return name
 
+    def new_label(self, prefix: str) -> str:
+        """Return a fresh, unique label name like LOOP_0; emits nothing."""
+        n = self.labels.get(prefix, 0)
+        self.labels[prefix] = n + 1
+        return f"{prefix}_{n}"
+
     def emit(self, line: str):
         """Append one indented instruction line to the body."""
         self.lines.append(f"    {line}")
+
+    def emit_label(self, label: str):
+        """Append a label line (unindented, no semicolon) as a branch target."""
+        self.lines.append(f"{label}:")
+
+    def reg_decls(self) -> list[str]:
+        """Return one .reg declaration per register family in use, sized by its count."""
+        reg_decl_lines = []
+        for reg_prefix, count in self.reg_counts.items():
+            if count != 0:
+                line = f"    .reg {PTX_REG_TYPES[reg_prefix]} %{reg_prefix}<{count}>;"
+                reg_decl_lines.append(line)
+
+        return reg_decl_lines
+
+    # --- Prologue ---------------------------------------------------------------------------
 
     def emit_param_loads(self, arg_order: list[str]):
         """Load each buffer's pointer param and convert it to a global address; record it in self.buffers."""
@@ -121,12 +176,36 @@ class KernelBuilder:
         self.values["warp"] = warp
 
     def emit_bounds_guard(self, total_cells: int):
-        """Send threads past the Tile's last cell (global index >= total_cells) straight to DONE."""
-        global_idx = self.global_idx
-
+        """Send threads past the Tile's last cell (global index >= total_cells) straight to the exit."""
         pred = self.new_reg("p")
-        self.emit(f"setp.ge.u32 {pred}, {global_idx}, {total_cells};")
-        self.emit(f"@{pred} bra DONE;")
+        self.emit(f"setp.ge.u32 {pred}, {self.global_idx}, {total_cells};")
+        self.emit(f"@{pred} bra {EXIT_LABEL};")
+
+    def emit_tile_axes(self, axes):
+        """Split the global index into one value per Tile axis, last axis fastest: (gid / stride) % extent."""
+        for i, axis in enumerate(axes):
+            extent = axis.extent.as_static()
+            stride = math.prod(a.extent.as_static() for a in axes[i + 1:])
+
+            value = self.global_idx
+            if stride > 1:
+                r = self.new_reg("r")
+                self.emit(f"div.u32 {r}, {value}, {stride};")
+                value = r
+
+            if i > 0:
+                r = self.new_reg("r")
+                self.emit(f"rem.u32 {r}, {value}, {extent};")
+                value = r
+
+            self.values[axis.name] = value
+
+    def emit_exit(self):
+        """End the body with the exit label (the bounds guard's target) and ret."""
+        self.emit_label(EXIT_LABEL)
+        self.emit("ret;")
+
+    # --- Expressions and addresses ----------------------------------------------------------
 
     def emit_expr(self, expr) -> str:
         """Emit PTX for an integer index expression tree; return the %r register holding its value."""
@@ -141,14 +220,14 @@ class KernelBuilder:
             right = self.emit_expr(expr.right)
 
             if expr.op not in INDEX_OPS:
-                raise NotImplementedError(f"index op {expr.op!r} is not supported")
+                raise NotImplementedError(f"index op {expr.op!r} not supported")
 
             instruction = INDEX_OPS[expr.op]
             dst = self.new_reg("r")
             self.emit(f"{instruction} {dst}, {left}, {right};")
             return dst
         else:
-            raise NotImplementedError(f"index expression type {type(expr).__name__}")
+            raise NotImplementedError(f"index expression type {type(expr).__name__} not supported")
 
     def emit_address(self, buffer: str, index, nbytes: int) -> str:
         """Emit the address of buffer[index] (global or shared) for nbytes-wide elements; return its %rd register.
@@ -179,64 +258,7 @@ class KernelBuilder:
 
         return offset_addr
 
-    def emit_load(self, stmt):
-        """Emit ld.global.f32 for a scalar Load into a fresh %f; record it under the Load's name."""
-        if len(stmt.names) != 1:
-            raise NotImplementedError("vectorized loads aren't supported yet")
-
-        addr = self.emit_address(stmt.input, stmt.index, stmt.dtype.nbytes)
-        value = self.new_reg("f")
-        space = "shared" if stmt.input in self.shared else "global"
-        self.emit(f"ld.{space}.f32 {value}, [{addr}];")
-        self.values[stmt.names[0]] = value
-
-    def emit_assign(self, stmt):
-        """Emit one float elementwise op over already-computed values; record the result under its name."""
-
-        if stmt.op.name == "exp":
-            x = self.values[stmt.args[0]]
-            t = self.new_reg("f")
-            self.emit(f"mul.f32 {t}, {x}, {ptx_f32(LOG2_E)};")
-
-            dst = self.new_reg("f")
-            self.emit(f"ex2.approx.f32 {dst}, {t};")
-
-            self.values[stmt.name] = dst
-            return
-
-        if stmt.op.name not in FLOAT_OPS:
-            raise NotImplementedError(f"float op {stmt.op.name} is not implemented yet")
-
-        instr, extras = FLOAT_OPS[stmt.op.name]
-        registers = [self.values[a] for a in stmt.args]
-        operands = registers + extras
-
-        dst = self.new_reg("f")
-
-        self.emit(f"{instr} {dst}, {", ".join(operands)};")
-        self.values[stmt.name] = dst
-
-    def emit_write(self, stmt):
-        """Emit a store of 1, 2 or 4 consecutive f32 values (st.global / .v2 / .v4) to output[index]."""
-        if stmt.atomic or stmt.swizzle != "NONE":
-            raise NotImplementedError(
-                f"Write to {stmt.output}: atomic={stmt.atomic}, swizzle={stmt.swizzle} not supported yet")
-
-        count = len(stmt.values)
-        if count not in (1, 2, 4):
-            raise NotImplementedError(
-                f"Write to {stmt.output}: {count} values not supported (expected 1, 2 or 4)")
-
-        addr = self.emit_address(stmt.output, stmt.index, stmt.value_dtype.nbytes)
-        registers = [self.values[a] for a in stmt.values]
-
-        space = "shared" if stmt.output in self.shared else "global"
-
-        if count == 1:
-            self.emit(f"st.{space}.f32 [{addr}], {registers[0]};")
-        else:
-            operands = ", ".join(registers)
-            self.emit(f"st.{space}.v{count}.f32 [{addr}], {{{operands}}};")
+    # --- Statements -------------------------------------------------------------------------
 
     def emit_body(self, stmts):
         """Translate each body statement in order, dispatching on its type."""
@@ -247,28 +269,87 @@ class KernelBuilder:
                 self.emit_assign(stmt)
             elif isinstance(stmt, Write):
                 self.emit_write(stmt)
+            elif isinstance(stmt, Let):
+                self.emit_let(stmt)
             elif isinstance(stmt, Accum):
                 self.emit_accum(stmt)
             elif isinstance(stmt, StridedLoop):
                 self.emit_strided_loop(stmt)
-            elif isinstance(stmt, WarpShuffle):
-                self.emit_warp_shuffle(stmt)
-            elif isinstance(stmt, Smem):
-                self.emit_smem(stmt)
             elif isinstance(stmt, Cond):
                 self.emit_cond(stmt)
+            elif isinstance(stmt, Smem):
+                self.emit_smem(stmt)
             elif isinstance(stmt, Sync):
                 self.emit_sync(stmt)
+            elif isinstance(stmt, WarpShuffle):
+                self.emit_warp_shuffle(stmt)
             elif isinstance(stmt, TreeHalve):
                 self.emit_tree_halve(stmt)
-            elif isinstance(stmt, Let):
-                self.emit_let(stmt)
             else:
-                raise NotImplementedError(f"stmt type {type(stmt).__name__}")
+                raise NotImplementedError(f"stmt type {type(stmt).__name__} not supported")
 
-    def emit_label(self, label: str):
-        """Append a label line (unindented, no semicolon) as a branch target."""
-        self.lines.append(f"{label}:")
+    def emit_load(self, stmt):
+        """Emit ld.global/ld.shared.f32 for a scalar Load into a fresh %f; record it under the Load's name."""
+        if len(stmt.names) != 1:
+            raise NotImplementedError(f"vectorized load of {len(stmt.names)} values not supported")
+
+        addr = self.emit_address(stmt.input, stmt.index, stmt.dtype.nbytes)
+        value = self.new_reg("f")
+        space = "shared" if stmt.input in self.shared else "global"
+        self.emit(f"ld.{space}.f32 {value}, [{addr}];")
+        self.values[stmt.names[0]] = value
+
+    def emit_assign(self, stmt):
+        """Emit one float elementwise op over already-computed values; record the result under its name."""
+        if stmt.op.name == "exp":
+            # PTX only has 2^x (ex2), so e^x = 2^(x * log2(e)).
+            x = self.values[stmt.args[0]]
+            t = self.new_reg("f")
+            self.emit(f"mul.f32 {t}, {x}, {ptx_f32(LOG2_E)};")
+
+            dst = self.new_reg("f")
+            self.emit(f"ex2.approx.f32 {dst}, {t};")
+
+            self.values[stmt.name] = dst
+            return
+
+        instr, extras = float_op(stmt.op.name)
+        registers = [self.values[a] for a in stmt.args]
+        operands = registers + extras
+
+        dst = self.new_reg("f")
+        self.emit(f"{instr} {dst}, {", ".join(operands)};")
+        self.values[stmt.name] = dst
+
+    def emit_write(self, stmt):
+        """Emit a store of 1, 2 or 4 consecutive f32 values (st / .v2 / .v4, global or shared) to output[index]."""
+        if stmt.atomic or stmt.swizzle != "NONE":
+            raise NotImplementedError(
+                f"Write to {stmt.output}: atomic={stmt.atomic}, swizzle={stmt.swizzle} not supported")
+
+        count = len(stmt.values)
+        if count not in (1, 2, 4):
+            raise NotImplementedError(
+                f"Write to {stmt.output}: {count} values not supported (expected 1, 2 or 4)")
+
+        addr = self.emit_address(stmt.output, stmt.index, stmt.value_dtype.nbytes)
+        registers = [self.values[a] for a in stmt.values]
+        space = "shared" if stmt.output in self.shared else "global"
+
+        if count == 1:
+            self.emit(f"st.{space}.f32 [{addr}], {registers[0]};")
+        else:
+            operands = ", ".join(registers)
+            self.emit(f"st.{space}.v{count}.f32 [{addr}], {{{operands}}};")
+
+    def emit_let(self, stmt):
+        """Bind a name to a float constant (e.g. one = 1.0) in a fresh %f register."""
+        if not isinstance(stmt.value, Literal):
+            raise NotImplementedError(f"Let of {type(stmt.value).__name__} not supported")
+
+        f = self.new_reg("f")
+        self.emit(f"mov.f32 {f}, {ptx_f32(stmt.value.value)};")
+        self.values[stmt.name] = f
 
     def emit_accum(self, stmt):
         """Fold a value into its loop accumulator in place; no new register.
@@ -280,10 +361,7 @@ class KernelBuilder:
         val = self.values[stmt.value]
         first = accum if stmt.base is None else self.values[stmt.base]
 
-        if stmt.op.name not in FLOAT_OPS:
-            raise NotImplementedError(f"float op {stmt.op.name} is not implemented yet")
-
-        instr, extras = FLOAT_OPS[stmt.op.name]
+        instr, _ = float_op(stmt.op.name)
         self.emit(f"{instr} {accum}, {first}, {val};")
 
     def emit_strided_loop(self, stmt):
@@ -315,6 +393,53 @@ class KernelBuilder:
         self.emit(f"bra {top};")
         self.emit_label(end)
 
+    def emit_cond(self, stmt):
+        """Run the body only where the comparison holds: setp, then branch past the body when false."""
+        if not isinstance(stmt.cond, BinaryExpr) or stmt.cond.op not in COMPARISON_TABLE:
+            raise NotImplementedError(
+                f"Cond with {type(stmt.cond).__name__} {getattr(stmt.cond, 'op', '')!r} not supported")
+
+        if stmt.else_body:
+            raise NotImplementedError("Cond with an else_body not supported")
+
+        cmp = COMPARISON_TABLE[stmt.cond.op]
+        left = self.emit_expr(stmt.cond.left)
+        right = self.emit_expr(stmt.cond.right)
+
+        pred = self.new_reg("p")
+        self.emit(f"setp.{cmp}.u32 {pred}, {left}, {right};")
+
+        skip = self.new_label("SKIP")
+        self.emit(f"@!{pred} bra {skip};")
+
+        self.emit_body(stmt.body)
+        self.emit_label(skip)
+
+    def emit_smem(self, stmt):
+        """Declare a module-level .shared array and record its base address as a shared buffer."""
+        if stmt.dtype != "float":
+            raise NotImplementedError(f"Smem of {stmt.dtype} not supported")
+
+        name = stmt.name
+        align = stmt.align or 4
+        size = math.prod(stmt.extents) * 4
+        self.shapes[name] = list(stmt.extents)
+
+        self.smem_decls.append(f".shared .align {align} .b8 {name}[{size}];")
+
+        base_addr = self.new_reg("rd")
+        self.emit(f"mov.u64 {base_addr}, {name};")
+
+        self.buffers[name] = base_addr
+        self.shared.add(name)
+
+    def emit_sync(self, stmt):
+        """Emit a block-wide barrier (bar.sync): no thread continues until every thread arrives."""
+        if stmt.warp or stmt.count is not None:
+            raise NotImplementedError(f"Sync with warp={stmt.warp}, count={stmt.count} not supported")
+
+        self.emit(f"bar.sync {stmt.barrier_id};")
+
     def emit_warp_shuffle(self, stmt):
         """Combine state across a warp with a shfl.sync.bfly butterfly (offsets length/2 .. 1)."""
         offset = stmt.length // 2
@@ -334,56 +459,14 @@ class KernelBuilder:
 
             offset //= 2
 
-    def emit_smem(self, stmt):
-        """Declare a module-level .shared array and record its base address as a shared buffer."""
-        name = stmt.name
-        align = stmt.align or 4
-        size = math.prod(stmt.extents)
-        self.shapes[name] = list(stmt.extents)
-
-        if stmt.dtype != 'float':
-            raise NotImplementedError(f"{stmt.dtype} not implemented yet")
-        size *= 4
-
-        self.smem_decls.append(f".shared .align {align} .b8 {name}[{size}];")
-
-        base_addr = self.new_reg("rd")
-        self.emit(f"mov.u64 {base_addr}, {name};")
-
-        self.buffers[name] = base_addr
-        self.shared.add(name)
-
-    def emit_cond(self, stmt):
-        """Run the body only where the comparison holds: setp, then branch past the body when false."""
-        if (not isinstance(stmt.cond, BinaryExpr)) or (stmt.cond.op not in COMPARISON_TABLE):
-            raise NotImplementedError(f"Cond with {type(stmt.cond).__name__} {getattr(stmt.cond, 'op', '')!r} not supported")
-
-        if stmt.else_body:
-            raise NotImplementedError("Cond with an else_body is not supported yet")
-
-        cmp = COMPARISON_TABLE[stmt.cond.op]
-        left = self.emit_expr(stmt.cond.left)
-        right = self.emit_expr(stmt.cond.right)
-
-        pred = self.new_reg("p")
-        self.emit(f"setp.{cmp}.u32 {pred}, {left}, {right};")
-
-        skip = self.new_label("SKIP")
-        self.emit(f"@!{pred} bra {skip};")
-
-        self.emit_body(stmt.body)
-        self.emit_label(skip)
-
-    def emit_sync(self, stmt):
-        """Emit a block-wide barrier (bar.sync): no thread continues until every thread arrives."""
-        if stmt.warp or (stmt.count is not None):
-            raise NotImplementedError(f"Sync with warp={stmt.warp}, count={stmt.count} not supported yet")
-
-        self.emit(f"bar.sync {stmt.barrier_id};")
-
     def emit_tree_halve(self, stmt):
+        """Combine the per-warp partials in shared memory; every thread ends up holding the total.
+
+        Each thread seeds its state from slot 0, then folds in slots 1 .. length-1 with the
+        IR's combine_states. All threads read the same addresses, which shared memory broadcasts.
+        """
         if stmt.inner is not None:
-            raise NotImplementedError("TreeHalve with an inner reduction is not supported yet")
+            raise NotImplementedError("TreeHalve with an inner reduction not supported")
 
         for buf, s in zip(stmt.bufs, stmt.state):
             base = self.buffers[buf]
@@ -395,55 +478,11 @@ class KernelBuilder:
             for buf, s_b in zip(stmt.bufs, stmt.state_b):
                 base = self.buffers[buf]
                 f = self.new_reg("f")
-                self.emit(f"ld.shared.f32 {f}, [{base}+{i*stmt.dtype.nbytes}];")
+                self.emit(f"ld.shared.f32 {f}, [{base}+{i * stmt.dtype.nbytes}];")
                 self.values[s_b] = f
 
             for a in stmt.combine_states:
                 self.emit_assign(a)
-
-    def emit_tile_axes(self, axes):
-        """Split the global index into one value per Tile axis, last axis fastest: (gid / stride) % extent."""
-        for i, axis in enumerate(axes):
-            extent = axis.extent.as_static()
-            stride = math.prod(a.extent.as_static() for a in axes[i+1:])
-
-            value = self.global_idx
-            if stride > 1:
-                r = self.new_reg("r")
-                self.emit(f"div.u32 {r}, {value}, {stride};")
-                value = r
-
-            if i > 0:
-                r = self.new_reg("r")
-                self.emit(f"rem.u32 {r}, {value}, {extent};")
-                value = r
-
-            self.values[axis.name] = value
-
-    def emit_let(self, stmt):
-        """Bind a name to a float constant (e.g. one = 1.0) in a fresh %f register."""
-        if isinstance(stmt.value, Literal):
-            f = self.new_reg("f")
-            self.emit(f"mov.f32 {f}, {ptx_f32(stmt.value.value)};")
-            self.values[stmt.name] = f
-        else:
-            raise NotImplementedError(f"Let of {type(stmt.value).__name__} not supported yet")
-
-    def new_label(self, prefix: str) -> str:
-        """Return a fresh, unique label name like LOOP_0; emits nothing."""
-        n = self.labels.get(prefix, 0)
-        self.labels[prefix] = n + 1
-        return f"{prefix}_{n}"
-
-    def reg_decls(self) -> list[str]:
-        """Return one .reg declaration per register family in use, sized by its count."""
-        reg_decl_lines = []
-        for reg_prefix, count in self.reg_counts.items():
-            if count != 0:
-                line = f"    .reg {PTX_REG_TYPES[reg_prefix]} %{reg_prefix}<{count}>;"
-                reg_decl_lines.append(line)
-
-        return reg_decl_lines
 
 
 def emit_header() -> list[str]:
@@ -451,7 +490,7 @@ def emit_header() -> list[str]:
     header_lines = [
         ".version 8.0",
         ".target sm_89",
-        ".address_size 64"
+        ".address_size 64",
     ]
 
     return header_lines
@@ -505,45 +544,54 @@ def get_kernel_meta(meta: dict, kernel_op_name: str) -> dict:
     return kmeta
 
 
+def load_kernel(ir_path: Path) -> tuple[KernelOp, dict]:
+    """Read the IR file and the meta.json beside it; return the KernelOp and its meta entry."""
+    g = Graph.from_dict(json.loads(ir_path.read_text()))
+    meta = json.loads((ir_path.parent / "meta.json").read_text())
+
+    kernel_op = get_kernel_op(g)
+    return kernel_op, get_kernel_meta(meta, kernel_op.name)
+
+
+def compile_kernel(kernel_op: KernelOp, kernel_meta: dict) -> str:
+    """Translate one KernelOp into a complete PTX module and return it as text."""
+    kb = KernelBuilder()
+    kb.set_shapes(kernel_meta["args"])
+
+    # Prologue: buffer pointers, then which cell this thread runs.
+    tile = kernel_op.body[0]
+    kb.emit_param_loads(kernel_meta["arg_order"])
+    kb.emit_thread_index()
+    kb.emit_bounds_guard(math.prod(a.extent.as_static() for a in tile.axes))
+    kb.emit_tile_axes(tile.axes)
+
+    # Body: the IR statements, then the exit the bounds guard jumps to.
+    kb.emit_body(tile.body)
+    kb.emit_exit()
+
+    # Assemble: register declarations go first, though they are only known now.
+    ptx = [*emit_header(), ""]
+    if kb.smem_decls:
+        ptx += [*kb.smem_decls, ""]
+    ptx += [
+        *emit_signature(kernel_op.name, kernel_meta["arg_order"]),
+        "{",
+        *kb.reg_decls(),
+        "",
+        *kb.lines,
+        "}",
+    ]
+    return "\n".join(ptx)
+
+
 def main():
+    """Read the IR path from argv, compile its kernel, and print the PTX to stdout."""
     if len(sys.argv) != 2:
         print("usage: python compile.py path/to/kernel.ir.json", file=sys.stderr)
         sys.exit(1)
 
-    ir_path = Path(sys.argv[1])
-    g = Graph.from_dict(json.load(open(ir_path)))
-    meta = json.load(open(ir_path.parent / "meta.json"))
-
-    kernel_op = get_kernel_op(g)
-    kernel_meta = get_kernel_meta(meta, kernel_op.name)
-
-    header = emit_header()
-    signature = emit_signature(kernel_op.name, kernel_meta["arg_order"])
-
-    kb = KernelBuilder()
-    kb.set_shapes(kernel_meta["args"])
-    kb.emit_param_loads(kernel_meta["arg_order"])
-
-    tile = kernel_op.body[0]
-    kb.emit_thread_index()
-    kb.emit_bounds_guard(math.prod(a.extent.as_static() for a in tile.axes))
-    kb.emit_tile_axes(tile.axes)
-    kb.emit_body(tile.body)
-
-    print("\n".join(header))
-    print()
-    if kb.smem_decls:
-        print("\n".join(kb.smem_decls))
-        print()
-    print("\n".join(signature))
-    print("{")
-    print("\n".join(kb.reg_decls()))
-    print()
-    print("\n".join(kb.lines))
-    print()
-    print("DONE:")
-    print("    ret;")
-    print("}")
+    kernel_op, kernel_meta = load_kernel(Path(sys.argv[1]))
+    print(compile_kernel(kernel_op, kernel_meta))
 
 
 if __name__ == "__main__":
